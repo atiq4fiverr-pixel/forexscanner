@@ -187,8 +187,9 @@ def run_once():
     state = {k: v for k, v in state.items() if now - v < 48 * 3600}
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
-    if new_msgs:
-        send("\n\n".join(new_msgs))
+    for m in new_msgs:
+           send(m)
+           time.sleep(1)
     print(time.strftime("%H:%M:%S"), "alerts:", len(new_msgs))
 
 
