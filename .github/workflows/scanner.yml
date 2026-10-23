@@ -33,4 +33,4 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
-        run: python forex_scanner.py --once
+         run: python forex_scanner.py --once --listen 240
