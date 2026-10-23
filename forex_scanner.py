@@ -9,8 +9,11 @@ Install:  pip install pandas numpy requests   (yfinance ki zaroorat nahi - Andro
 Run:      export TG_TOKEN="..." ; export TG_CHAT="..."
           python forex_scanner.py          (har 5 min loop)
           python forex_scanner.py --once   (sirf ek baar)
+          python forex_scanner.py --once --listen 240   (scan + 240 sec bot commands sunna)
+
+Bot: Telegram mein pair ka naam likhein (btcusd, eth, gold, eurusd) -> levels mil jayen ge.
 """
-import os, sys, json, time
+import os, sys, json, time, re
 import numpy as np
 import pandas as pd
 import requests
@@ -187,15 +190,195 @@ def run_once():
     state = {k: v for k, v in state.items() if now - v < 48 * 3600}
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
-    for m in new_msgs:
-           send(m)
-           time.sleep(1)
+    for m in new_msgs:          # har alert alag message
+        send(m)
+        time.sleep(1)           # Telegram rate limit se bachne ke liye
     print(time.strftime("%H:%M:%S"), "alerts:", len(new_msgs))
 
 
+# ================= On-demand bot: pair likho -> levels lo =================
+ALIASES = {"BTC": "BTCUSD", "ETH": "ETHUSD", "GOLD": "XAUUSD", "XAU": "XAUUSD"}
+
+HELP = ("🤖 Pair ka naam likhein, main levels bhej dunga.\n"
+        "Misal: btcusd  |  eth  |  gold  |  eurusd  |  gbpjpy\n"
+        "Aik message mein 3 pairs tak: btc eth gold\n"
+        "/list = saari pairs")
+
+
+def norm(tok):
+    t = tok.split("@")[0]
+    t = "".join(ch for ch in t.upper() if ch.isalnum())
+    t = ALIASES.get(t, t)
+    return t if t in ALL else None
+
+
+def all_swings(df, n=SWING_N, lookback=200):
+    H, L, out = df.High.values, df.Low.values, []
+    for i in range(max(n, len(df) - lookback), len(df) - n):
+        if H[i] == H[i - n:i + n + 1].max():
+            out.append(("HIGH", H[i]))
+        if L[i] == L[i - n:i + n + 1].min():
+            out.append(("LOW", L[i]))
+    return out
+
+
+def fvgs(df, a, lookback=120):
+    """Unfilled Fair Value Gaps (3 candle gap)."""
+    out = []
+    H, L = df.High.values, df.Low.values
+    n = len(df)
+    for i in range(max(1, n - lookback), n - 1):
+        av = a.iloc[i]
+        if np.isnan(av):
+            continue
+        if L[i + 1] > H[i - 1] and L[i + 1] - H[i - 1] >= 0.1 * av:
+            lo, hi = H[i - 1], L[i + 1]
+            if not (L[i + 2:] <= lo).any():
+                out.append(("BULL", lo, hi))
+        elif H[i + 1] < L[i - 1] and L[i - 1] - H[i + 1] >= 0.1 * av:
+            lo, hi = H[i + 1], L[i - 1]
+            if not (H[i + 2:] >= hi).any():
+                out.append(("BEAR", lo, hi))
+    return out
+
+
+def tf_report(pair, tf, df, price):
+    if len(df) < 40:
+        return f"⏱ {tf}: data kam hai"
+    a = atr(df)
+    sell, buy = [], []   # (distance, text)
+
+    def zone_txt(label, lo, hi):
+        if abs(hi - lo) < 1e-12:
+            return f"{label} {fmt(pair, lo)}"
+        return f"{label} {fmt(pair, lo)} - {fmt(pair, hi)}"
+
+    def add(side, label, lo, hi):
+        if side == "SELL":
+            if hi < price:
+                return
+            dist = max(0.0, lo - price)
+        else:
+            if lo > price:
+                return
+            dist = max(0.0, price - hi)
+        txt = zone_txt(label, lo, hi)
+        if lo <= price <= hi:
+            txt += "  ← price andar"
+        else:
+            txt += f"  ({dist / price * 100:.2f}%)"
+        (sell if side == "SELL" else buy).append((dist, txt))
+
+    for kind, lvl in all_swings(df):
+        if kind == "HIGH":
+            add("SELL", "Swing High", lvl, lvl)
+        else:
+            add("BUY", "Swing Low", lvl, lvl)
+    for kind, lo, hi, _t in order_blocks(df, a):
+        add("SELL" if kind == "BEAR" else "BUY", f"{'Bear' if kind == 'BEAR' else 'Bull'} OB", lo, hi)
+    for kind, lo, hi in fvgs(df, a):
+        add("SELL" if kind == "BEAR" else "BUY", f"{'Bear' if kind == 'BEAR' else 'Bull'} FVG", lo, hi)
+
+    def lines(items):
+        seen, out = set(), []
+        for _d, t in sorted(items, key=lambda x: x[0]):
+            if t not in seen:
+                seen.add(t)
+                out.append("   • " + t)
+            if len(out) == 4:
+                break
+        return "\n".join(out) if out else "   (koi level nahi)"
+
+    return (f"⏱ {tf}\n🔴 Possible SELL zones (upar):\n{lines(sell)}\n"
+            f"🟢 Possible BUY zones (neeche):\n{lines(buy)}")
+
+
+def build_report(pair):
+    d = fetch(pair)
+    price = float(d.Close.iloc[-1])
+    h1 = d.iloc[:-1]
+    h4 = d.resample("4h").agg({"Open": "first", "High": "max",
+                               "Low": "min", "Close": "last"}).dropna().iloc[:-1]
+    parts = [f"📊 {pair} | Price {fmt(pair, price)}",
+             tf_report(pair, "4H", h4, price),
+             tf_report(pair, "1H", h1, price),
+             "ℹ️ Ye sirf technical levels hain, entry/exit ki salah ya guarantee nahi."]
+    return "\n\n".join(parts)
+
+
+def handle_text(text):
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("/list"):
+        send("Pairs:\n" + ", ".join(ALL))
+        return
+    if low.startswith(("/start", "/help")):
+        send(HELP)
+        return
+    toks = [x for x in re.split(r"[\s,]+", t) if x][:3]
+    found = False
+    for tok in toks:
+        p = norm(tok)
+        if not p:
+            continue
+        found = True
+        try:
+            send(build_report(p))
+        except Exception as e:
+            send(f"{p}: data nahi aya, thori der baad try karein ({e})")
+    if not found:
+        send("Pair samajh nahi aya 🤔\n\n" + HELP)
+
+
+def tg_get(offset, timeout):
+    params = {"timeout": timeout, "allowed_updates": json.dumps(["message"])}
+    if offset is not None:
+        params["offset"] = offset
+    r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                     params=params, timeout=timeout + 15)
+    return r.json().get("result", [])
+
+
+def listen(seconds):
+    """Telegram messages sunta hai; sirf aap (TG_CHAT) ke messages ka jawab deta hai."""
+    if not TOKEN or not CHAT:
+        print("TG_TOKEN / TG_CHAT set nahi - listen skip")
+        return
+    end = time.time() + seconds
+    offset = None
+    while True:
+        left = end - time.time()
+        if left < 3:
+            break
+        try:
+            ups = tg_get(offset, int(min(25, left - 1)))
+        except Exception as e:
+            print("getUpdates error:", e)
+            time.sleep(3)
+            continue
+        for u in ups:
+            offset = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str(m.get("chat", {}).get("id")) != str(CHAT) or not m.get("text"):
+                continue
+            try:
+                handle_text(m["text"])
+            except Exception as e:
+                print("handle error:", e)
+    if offset is not None:
+        try:
+            tg_get(offset, 0)   # aakhri updates confirm
+        except Exception:
+            pass
+    print("listen khatam")
+
+
 if __name__ == "__main__":
-    if "--once" in sys.argv:
-        run_once()
+    if "--once" in sys.argv or "--listen" in sys.argv:
+        if "--once" in sys.argv:
+            run_once()
+        if "--listen" in sys.argv:
+            listen(int(sys.argv[sys.argv.index("--listen") + 1]))
     else:
         send("✅ Scanner shuru ho gaya (Forex + BTC + ETH + Gold)")
         while True:
